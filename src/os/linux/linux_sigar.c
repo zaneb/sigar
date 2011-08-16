@@ -46,6 +46,13 @@
 #define PROC_PARTITIONS PROC_FS_ROOT "partitions"
 #define PROC_DISKSTATS  PROC_FS_ROOT "diskstats"
 
+typedef struct {
+    sigar_cpu_info_t cpu;
+    int socket;
+    int core;
+    int processor;
+} processor_info_t;
+
 /*
  * /proc/self/stat fields:
  * 1 - pid
@@ -1499,16 +1506,15 @@ static SIGAR_INLINE void cpu_info_strcpy(char *ptr, char *buf, int len)
     }
 }
 
-static int get_cpu_info(sigar_t *sigar, sigar_cpu_info_t *info,
+static int get_cpu_info(sigar_t *sigar, processor_info_t *proc,
                         FILE *fp)
 {
     char buffer[BUFSIZ], *ptr;
+    sigar_cpu_info_t *info = &proc->cpu;
 
     int found = 0;
 
-    /* UML vm wont have "cpu MHz" or "cache size" fields */
-    info->mhz        = 0;
-    info->cache_size = 0;
+    memset(proc, 0, sizeof(*proc));
 
 #ifdef __powerpc64__
     SIGAR_SSTRCPY(info->vendor, "IBM");
@@ -1519,6 +1525,10 @@ static int get_cpu_info(sigar_t *sigar, sigar_cpu_info_t *info,
           case 'p': /* processor	: 0 */
             if (strnEQ(ptr, "processor", 9)) {
                 found = 1;
+            }
+            else if (strnEQ(ptr, "physical id", 11)) {
+                ptr = cpu_info_strval(ptr);
+                proc->socket = sigar_strtoul(ptr);
             }
             break;
           case 'v':
@@ -1554,6 +1564,14 @@ static int get_cpu_info(sigar_t *sigar, sigar_cpu_info_t *info,
             else if (strnEQ(ptr, "cache size", 10)) {
                 ptr = cpu_info_strval(ptr);
                 info->cache_size = sigar_strtoul(ptr);
+            }
+            else if (strnEQ(ptr, "core id", 7)) {
+                ptr = cpu_info_strval(ptr);
+                proc->core = sigar_strtoul(ptr);
+            }
+            else if (strnEQ(ptr, "cpu cores", 9)) {
+                ptr = cpu_info_strval(ptr);
+                info->cores_per_socket = sigar_strtoul(ptr);
             }
 #ifdef __powerpc64__
             /* each /proc/cpuinfo entry looks like so:
@@ -1618,11 +1636,55 @@ static void get_cpuinfo_min_freq(sigar_cpu_info_t *cpu_info, int num)
     }
 }
 
+typedef struct {
+    size_t size;
+    sigar_uint32_t *data;
+} bitmap_t;
+
+static int bitmap_check(sigar_t *sigar, bitmap_t *bitmap, unsigned int index)
+{
+    int ret = 0;
+    size_t i = index / 32;
+    if (i >= bitmap->size) {
+        void *new_data;
+        size_t old_size = bitmap->size;
+
+        bitmap->size *= 2;
+        if (i >= bitmap->size) {
+            bitmap->size = i + 1;
+        }
+
+        new_data = realloc(bitmap->data,
+                           bitmap->size * sizeof(sigar_uint32_t));
+
+        if (new_data) {
+            bitmap->data = new_data;
+            memset(&bitmap->data[old_size], 0,
+                   (bitmap->size - old_size) * sizeof(sigar_uint32_t));
+        } else {
+            // Out of memory. This could result in counting a single socket
+            // multiple times if the physical id is huge.
+            sigar_log_printf(sigar, SIGAR_LOG_WARN,
+                             "Cannot allocate CPU socket bitmap");
+            return 0;
+        }
+    } else {
+        ret = (bitmap->data[i] & (1 << (index % 32))) != 0;
+    }
+
+    bitmap->data[i] |= 1 << (index % 32);
+
+    return ret;
+}
+
 int sigar_cpu_info_list_get(sigar_t *sigar,
                             sigar_cpu_info_list_t *cpu_infos)
 {
     FILE *fp;
     int core_rollup = sigar_cpu_core_rollup(sigar), i=0;
+    processor_info_t processor;
+    int total_sockets = 0, total_cores = 0;
+    bitmap_t sockets_found = {};
 
     if (!(fp = fopen(PROC_FS_ROOT "cpuinfo", "r"))) {
         return errno;
@@ -1631,26 +1693,33 @@ int sigar_cpu_info_list_get(sigar_t *sigar,
     (void)sigar_cpu_total_count(sigar);
     sigar_cpu_info_list_create(cpu_infos);
 
-    while (get_cpu_info(sigar, &cpu_infos->data[cpu_infos->number], fp)) {
+    while (get_cpu_info(sigar, &processor, fp)) {
         sigar_cpu_info_t *info;
 
-        if (core_rollup && (i++ % sigar->lcpu)) {
-            continue; /* fold logical processors */
+        if (!bitmap_check(sigar, &sockets_found, processor.socket)) {
+            total_sockets++;
+            total_cores += processor.cpu.cores_per_socket;
+        } else if (core_rollup) {
+            continue;
         }
 
         info = &cpu_infos->data[cpu_infos->number];
-        get_cpuinfo_max_freq(info, cpu_infos->number);
-        get_cpuinfo_min_freq(info, cpu_infos->number);
 
-        info->total_cores = sigar->ncpu;
-        info->cores_per_socket = sigar->lcpu;
-        info->total_sockets = sigar_cpu_socket_count(sigar);
+        memcpy(info, &processor.cpu, sizeof(*info));
+        get_cpuinfo_max_freq(info, processor.processor);
+        get_cpuinfo_min_freq(info, processor.processor);
 
         ++cpu_infos->number;
         SIGAR_CPU_INFO_LIST_GROW(cpu_infos);
     }
 
     fclose(fp);
+    free(sockets_found.data);
+
+    for (i = 0; i < cpu_infos->number; i++) {
+        cpu_infos->data[i].total_cores = total_cores;
+        cpu_infos->data[i].total_sockets = total_sockets;
+    }
 
     return SIGAR_OK;
 }
